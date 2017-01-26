@@ -49,6 +49,7 @@
 #include "usbd_cdc_if.h"
 #include <stdarg.h>
 #include <string.h>
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
@@ -60,11 +61,15 @@ TIM_HandleTypeDef htim5;
 TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim11;
 
-typedef enum {STABILIZE, STOP, KEEPGOING} STATE;
-STATE state;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
+typedef enum {STABILIZE, STOP, KEEPGOING, SWINGUP} STATE;
+STATE state;
+
+typedef enum {LEFT, RIGHT, WAIT, DISTLIMIT} SWINGSTATE;
+SWINGSTATE swingstate;
+
 uint32_t timems = 0;
 uint8_t motorphase;
 float acc;
@@ -88,6 +93,8 @@ float angleShift = 0;
 int16_t angle0 = 0;
 int16_t angle1 = 0;
 int16_t angleHistory [5] = {};
+int32_t angleZeroPoint = 0;
+uint32_t count10 = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -116,7 +123,6 @@ void LED(int n, int on);
 void setAcc(float value);
 void setAccAU(float value);
 void setV(float value);
-float getProjectedPosDiff();
 float getProjectedPos();
 void setPWM(int32_t value);
 int16_t getAngle();
@@ -158,16 +164,17 @@ int main(void)
 
   /* USER CODE BEGIN 2 */
 
-  //LED flash
+  //LED flash heartbeat
   HAL_TIM_PWM_Start(&htim11, TIM_CHANNEL_1);
 
-  //LEDS
+  //set the LED values
   LED(0,0);
   LED(1,0);
   //LED(2,0);
   LED(3,1);
   HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, 0);
 
+  //Initialize the motor values
   motorBrake(0);
   motorPhase(1);
   //current limit at 1.0 is 4.95A
@@ -175,6 +182,8 @@ int main(void)
   motorNreset(1);
   motorNsleep(1);
   setState(STOP);
+
+  //start all the timeres
   HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_4);
 
   HAL_TIM_Encoder_Start(&htim3,TIM_CHANNEL_ALL);
@@ -182,14 +191,16 @@ int main(void)
 
   HAL_TIM_Base_Start_IT(&htim6);
 
+  //send a welcome message
   print("Welcome!\r\n");
   HAL_Delay(10);
   print("Starting...");
   HAL_Delay(150);
 
+  //start the movement
+//  setState(SWINGUP);
   setState(STABILIZE);
 //  setState(KEEPGOING);
-//  setV(0.2);
 
 
   /* USER CODE END 2 */
@@ -202,9 +213,14 @@ int main(void)
 //	  print("Hey\r\n");
 //	  print("Pos: %d\r\n", getPos());b
 
-	  print("Angle: %3d; AccAU: %4.1f; acc: %.5f vnew: %.3f; v: %.3f; Time: %5d; Timestart: %5d; Timediff: %4d; StartPos: %6.2f; Pos: %4d, Proj. pos: %6.2f; PWM: %6d; Integral: %7.1f; AngleIntegral: %5d; Angle Der: %d; Angle shift: %4.1f\r\n", \
-			  getAngle(), accAU, acc, vnew, v, timems, accStartTime, timems-accStartTime, accStartPos, getPos(), getProjectedPos(), getPWM(), accIntegral, angleIntegral, getAngle()-angleHistory[0], angleShift);
-	  HAL_Delay(2);
+	  //this prints data to the terminal for debugging purposes and to monitor the performance
+	  print("Angle: %4d; AccAU: %5.1f; acc: %8.5f vnew: %6.3f; v: %6.3f; Time: %5d; Timestart: %5d; Timediff: "
+			  "%4d; StartPos: %7.2f; Pos: %4d, Proj. pos: %7.2f; PWM: %6d; Integral: %8.1f; AngleIntegral: %5d; "
+			  "Angle Der: %4d; Angle shift: %4.1f; Stab: %d; AngleZP: %d\r\n", \
+			  getAngle(), accAU, acc, vnew, v, timems, accStartTime, timems-accStartTime,\
+			  accStartPos, getPos(), getProjectedPos(), getPWM(), accIntegral, angleIntegral,\
+			  getAngle()-angleHistory[0], angleShift, state == STABILIZE, angleZeroPoint);
+	  HAL_Delay(10);
 //	  if(acc ==0)
 //		  setAccAU(-10);
 
@@ -603,44 +619,110 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+//return the position where the cart should be if it moves with the initial velocity and acceleration given
 float getProjectedPos(){
 	return acc*(timems-accStartTime)*(timems-accStartTime)/2.0f + v*(timems-accStartTime) + accStartPos;
 //	return acc;
 }
 
-float getProjectedPosDiff(){
-	return (int32_t)(getProjectedPos() - accStartPos + 0.5f);
-}
-
-uint32_t count10 = 0;
-
+//this function gets called every 1 ms, it adjusts the motion of the cart according to the acceleration
+//it also changes the accleration based on the position of the stick
 void timeStep(){
 	timems++;
 	count10++;
 	vnew += acc;
+	//every 10 ms adjust the acceleration
 	if(count10==10){
 		count10=0;
-		angleP = 0.9f;
+		//all the PID values
+		angleP = 1.1f;
 		angleI = 0.0045;//0.0065;
-		angleD = 5;//3.25f;
-		posP = 3.0f/150.0f;
-		posD = 5.0f/1.0f;
-		angleShift = posP*getPos();
+		angleD = 6;//3.25f;
+		posP = 5.0f/150.0f;
+		posD = 2.0f/0.1f;
 		if(state == STABILIZE){
-			setAccAU(angleP*(getAngle()+angleShift) + angleD*(getAngle()-angleHistory[0]) + angleI*angleIntegral - vnew*posD);
-//			printf("AP: %.1f; AD: %.1f; AI: %.1f; PP: %.1f; PD: %.1f\r\n", angleP*getAngle(),angleD*(getAngle()-angleHistory[0]),angleI*angleIntegral,posP*getPos(),vnew*posD);
+			//here we change the acceleration using the PID algorithm
+			//we also take into account the angle shift, which changes the desired equilibrium angle
+			//this is so that the cart will start moving toward the center, if it is to the right,
+			//the equilibrium angle is to the left, so the cart will drift left etc, vnew is basically
+			//the corresponding D parameter to the drifting to the center
+			angleShift = posP*getPos();
+			setAccAU(angleP*(getAngle()-angleZeroPoint+angleShift) + angleD*(getAngle()-angleHistory[0]) + angleI*angleIntegral + vnew*posD);
 		}
+		//this keeps track of the angle positions to later calculate the derivative
 		for(uint8_t i = 0; i < 5-1; ++i){
 			angleHistory[i] = angleHistory[i+1];
 		}
 		angleHistory[4] = getAngle();
 	}
 	if(state == STABILIZE || state == KEEPGOING){
-		angleIntegral += getAngle()+angleShift;
+		angleIntegral += getAngle()-angleZeroPoint+angleShift;
 		adjustPWM();
-		if(abs(getPos()) > 400){
-			setState(STOP);
+	}
+	//this part deals with the swing up manuever
+	if(state == SWINGUP){
+		int16_t angleChange = getAngle() - angleHistory[0];
+		int32_t maxAcc = 30;
+		int32_t maxPos = 150;
+		//if we go too far on the rails, quickly accelerate the speed to zero
+		if(getProjectedPos() > maxPos && vnew >= 0.0f){
+			swingstate = DISTLIMIT;
+			if(fabsf(vnew) > 0.05f){
+				setAccAU(-2.5f*maxAcc);
+			}
+			else{
+				setV(0);
+			}
+			if(vnew == 0.0f){
+				swingstate = RIGHT;
+			}
 		}
+		if(getProjectedPos() < -maxPos && vnew <= 0.0f){
+			swingstate = DISTLIMIT;
+			if(fabsf(vnew) > 0.05f){
+				setAccAU(2.5f*maxAcc);
+			}
+			else{
+				setV(0);
+			}
+			if(vnew == 0.0f ){
+				swingstate = RIGHT;
+			}
+		}
+		//this accelerate to the right and will start accelerating to the left
+		//if the angle is such that the acceleration would work to increase the velocity
+		if(swingstate == RIGHT){
+			if(angleChange > 0 && abs(getAngle()) > 600){
+				swingstate = LEFT;
+			}
+			if(angleChange < 0 && abs(getAngle()) < 600){
+				swingstate = LEFT;
+			}
+			if(getProjectedPos() < maxPos){
+				setAccAU(maxAcc);
+			}
+		}
+		if(swingstate == LEFT){
+			if(angleChange < 0 && abs(getAngle()) > 600){
+				swingstate = RIGHT;
+			}
+			if(angleChange > 0 && abs(getAngle()) < 600){
+				swingstate = RIGHT;
+			}
+			if(getProjectedPos() > -maxPos){
+				setAccAU(-maxAcc);
+			}
+		}
+		adjustPWM();
+		//once we get to the top we go to the stabilizing mode
+		if(abs(getAngle()) > 1190){
+			state = STABILIZE;
+			angleZeroPoint = getAngle > 0 ? 1200 : -1200;
+		}
+	}
+	//stop the cart if it has moved too far to avoid damaging something
+	if(abs(getPos()) > 400){
+		setState(STOP);
 	}
 	if(state == STOP){
 		setAccAU(0);
@@ -649,6 +731,7 @@ void timeStep(){
 	}
 }
 
+//a function to set the state
 void setState(STATE newstate){
 	state = newstate;
 	if(newstate == STABILIZE || newstate == KEEPGOING){
@@ -660,8 +743,13 @@ void setState(STATE newstate){
 		setPWM(0);
 		setV(0);
 	}
+	if(newstate == SWINGUP){
+		swingstate = RIGHT;
+
+	}
 }
 
+//this function uses PWM to make sure that the cart position is the projected position based on the velocity and acceleration
 void adjustPWM(){
 	accP = 1500;
 	accI = 1;
@@ -674,6 +762,7 @@ void adjustPWM(){
 	setPWM(changePWM);
 }
 
+//sets the acceleration of the cart
 void setAcc(float value){
 	accAU = value/(gms*(2*PI/2400.0f));
 	acc = value;
@@ -682,6 +771,8 @@ void setAcc(float value){
 	v = vnew;
 }
 
+//this sets the acceleration in the units where in the right side of the differential equation in the
+//encoder angular units the acceleration is in the same units as the angle f''=k*(f+a)
 void setAccAU(float value){
 	accAU = value;
 	acc = value*gms*(2*PI/2400.0f);
@@ -705,7 +796,7 @@ int16_t getAngle(){
 }
 
 int32_t PWMChangeLimit = 300;
-//PWM value from 0 to 10k, which goes from 0% to 100%
+//PWM value from -10k to 10k, which goes from 0% to 100% in either direction
 void setPWM(int32_t value){
 	if(value > 10000)
 		value = 10000;
@@ -756,6 +847,7 @@ void motorLimit(float limit){
 	HAL_GPIO_WritePin(IO4_GPIO_Port, IO4_Pin, (value>>4)&1);
 }
 
+//for turning the leds on/off
 void LED(int n, int on){
 	if(n==0){
 		HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, !on);
@@ -771,8 +863,9 @@ void LED(int n, int on){
 	}
 }
 
+//this prints out the string to the terminal over USB, works with printf syntax
 void print(char* string, ...){
-	size_t maxsize = 256;
+	size_t maxsize = 512;
 	size_t size;
 	uint8_t buffer [maxsize];
 	va_list args;
